@@ -19,7 +19,7 @@ type HijackHandler func(conn net.Conn, proto string)
 // Hijack returns an http.Handler that performs a full HTTP/1.1 protocol upgrade
 // handshake and hands the raw connection to handler.
 //
-// protos is the optional set of protocol names the server accepts (e.g. "dbro/1").
+// protos is the optional set of protocol names the server accepts.
 // When no protos are provided, any non-empty Upgrade value is accepted.
 // When protos are provided, the client's Upgrade header is matched
 // case-insensitively; if it requests a protocol not in the list, a
@@ -121,21 +121,22 @@ func Hijack(handler HijackHandler, protos ...string) http.Handler {
 // and delegates the resulting raw connection to the underlying handler.
 type HTTPHijacker struct {
 	handler HijackHandler
+	protos  []string
 }
 
 // NewHTTPHijacker returns an HTTPHijacker that will delegate upgraded
 // connections to handler. It panics if handler is nil.
-func NewHTTPHijacker(handler HijackHandler) *HTTPHijacker {
+func NewHTTPHijacker(handler HijackHandler, protos ...string) *HTTPHijacker {
 	if handler == nil {
 		panic("cooper: nil HijackHandler passed to NewHTTPHijacker")
 	}
 
-	return &HTTPHijacker{handler: handler}
+	return &HTTPHijacker{handler: handler, protos: protos}
 }
 
 // ServeHTTP implements http.Handler by initiating a protocol upgrade for the
-// "dbro/0" protocol and handing the hijacked connection to the underlying
+// specified protocols and handing the hijacked connection to the underlying
 // HijackHandler.
 func (h *HTTPHijacker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	Hijack(h.handler, "dbro/0").ServeHTTP(w, r)
+	Hijack(h.handler, h.protos...).ServeHTTP(w, r)
 }
