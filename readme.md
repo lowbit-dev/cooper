@@ -1,98 +1,105 @@
 # cooper
 
-`cooper` handles the HTTP/1.1 `101 Switching Protocols` handshake — on both ends of a connection — and returns a `net.Conn`. It does nothing else.
+A Go package for handling the HTTP/1.1 `101 Switching Protocols` handshake on both ends of a connection returning a `net.Conn`.
 
-The handshake is a narrow, well-specified operation: exchange headers, agree on a protocol, and transfer connection ownership. Everything that follows — framing, message parsing, keep-alives, codec concerns — belongs to the application or to a protocol-specific package built on top. Cooper does not model protocols. It clears the path for them.
+## Features
+- **Server-side hijack**: Handle upgrade requests with `cooper.Hijack`, an `http.Handler` that negotiates the handshake and passes the raw connection to your code.
+- **Client-side upgrade**: Perform the client half of the handshake over any `net.Conn` with `cooper.Upgrade`.
+- **Protocol negotiation**: Restrict which protocols the server accepts; unrecognised clients receive `426 Upgrade Required`.
+- **Response validation**: Verify custom handshake headers (e.g. `Sec-WebSocket-Accept`) before the connection is handed over.
+- **Buffered data safety**: Leftover HTTP buffer bytes are transparently prepended to the returned connection — always safe to read from directly.
+- **Zero dependencies**: No external imports. Every type in the public API is from the standard library.
 
-Zero external dependencies. All types in the public API are from the standard library.
+## Installation
 
 ```
 go get lowbit.dev/cooper
 ```
 
----
-
-## Server side
-
-`cooper.Hijack` returns an `http.Handler`. On receipt of a valid upgrade request it performs the handshake, then transfers connection ownership to the provided handler. The handler runs in its own goroutine and is responsible for closing the connection.
+## Usage
 
 ```go
+// Server
 http.Handle("/raw", cooper.Hijack(func(conn net.Conn, proto string) {
     defer conn.Close()
-    // conn is a raw net.Conn. proto is the negotiated protocol name.
     io.Copy(conn, conn)
 }))
-```
 
-### Protocol restriction
-
-Pass `Protocols` to restrict which upgrade values the server accepts. Matching is case-insensitive. A client requesting an unlisted protocol receives `426 Upgrade Required` with the accepted list in the `Upgrade` response header. Without `Protocols`, any non-empty `Upgrade` value is accepted.
-
-```go
-cooper.Hijack(handler, cooper.Protocols("myproto/1", "myproto/2"))
-```
-
-### Additional response headers
-
-Some protocols require headers in the `101` response beyond the mandatory `Connection` and `Upgrade` fields. `ResponseHeaders` provides a hook for this. The function receives the original request and the negotiated protocol name; whatever it returns is merged into the response.
-
-```go
-cooper.Hijack(handler, cooper.ResponseHeaders(func(r *http.Request, proto string) http.Header {
-    h := http.Header{}
-    h.Set("Sec-WebSocket-Accept", deriveAccept(r.Header.Get("Sec-WebSocket-Key")))
-    return h
-}))
-```
-
-### Error handling
-
-Errors that occur after the response writer is no longer available — write and flush failures on the `101` response, and recovered panics from the handler goroutine — cannot be returned. `OnError` sets a callback to receive them. If not set, they are silently discarded.
-
-```go
-cooper.Hijack(handler, cooper.OnError(func(err error) {
-    slog.Error("upgrade error", "err", err)
-}))
-```
-
-The sentinel values `ErrHijackFailed`, `ErrWriteHandshake`, `ErrFlushHandshake`, `ErrHandlerPanic`, and `ErrDrainBuffer` can be used with `errors.Is` to distinguish failure modes.
-
----
-
-## Client side
-
-`cooper.Upgrade` performs the client half of the handshake over an existing `net.Conn`. The caller constructs the request in full; the only requirement is that it carries an `Upgrade` header. `Connection: Upgrade` is added automatically if absent. A 10-second deadline is applied to the handshake and cleared on return.
-
-```go
+// Client
 conn, _ := net.Dial("tcp", "host:8080")
-
 req, _ := http.NewRequest("GET", "http://host:8080/raw", nil)
 req.Header.Set("Upgrade", "myproto/1")
 
 upgraded, err := cooper.Upgrade(conn, req)
 if err != nil {
-    // err wraps one of the Err* sentinels from upgrade.go
+    // err wraps one of the Err* sentinels
 }
 defer upgraded.Close()
 ```
 
-`Upgrade` returns an error if the server responds with any status other than `101`, if the response `Upgrade` header does not echo the requested protocol, or if `Connection: Upgrade` is absent from the response.
-
-### Response validation
-
-Protocols that exchange additional headers during the handshake — WebSocket's `Sec-WebSocket-Accept`, for example — can be verified through `ResponseValidator`. The validator is called after Cooper's own checks pass. If it returns an error, `Upgrade` returns that error wrapped with `ErrResponseValidator`.
+## Server options
+- `Protocols(names ...string)`: Restrict accepted upgrade values. Case-insensitive. Unrecognised protocols receive `426`.
+- `ResponseHeaders(fn)`: Inject additional headers into the `101` response (e.g. `Sec-WebSocket-Accept`).
+- `OnError(fn)`: Receive errors that occur after the response writer is gone — write/flush failures and recovered handler panics.
 
 ```go
-cooper.Upgrade(conn, req, cooper.ResponseValidator(func(req *http.Request, resp *http.Response) error {
-    expected := deriveAccept(req.Header.Get("Sec-WebSocket-Key"))
-    if resp.Header.Get("Sec-WebSocket-Accept") != expected {
-        return errors.New("accept header mismatch")
-    }
-    return nil
-}))
+cooper.Hijack(handler,
+    cooper.Protocols("myproto/1", "myproto/2"),
+    cooper.ResponseHeaders(func(r *http.Request, proto string) http.Header {
+        h := http.Header{}
+        h.Set("Sec-WebSocket-Accept", deriveAccept(r.Header.Get("Sec-WebSocket-Key")))
+        return h
+    }),
+    cooper.OnError(func(err error) {
+        slog.Error("upgrade error", "err", err)
+    }),
+)
 ```
 
----
+## TLS
 
-## Buffered read data
+`cooper.Upgrade` works over any `net.Conn`, including TLS. Dial with `tls.Dial` before passing the connection in.
 
-Go's HTTP server buffers incoming data through a `bufio.Reader`. After the handshake request is parsed, that buffer may already contain bytes that belong to the raw protocol stream. Cooper drains those bytes and prepends them transparently to the returned connection via an internal `prefixConn` wrapper. The same applies on the client side. The returned `net.Conn` is always safe to read from directly.
+```go
+tlsConn, err := tls.Dial("tcp", "host:8443", &tls.Config{
+    ServerName: "host",
+})
+if err != nil {
+    // handle
+}
+
+req, _ := http.NewRequest("GET", "https://host:8443/raw", nil)
+req.Header.Set("Upgrade", "myproto/1")
+
+upgraded, err := cooper.Upgrade(tlsConn, req)
+```
+
+## Client options
+- `ResponseValidator(fn)`: Called after Cooper's own checks pass. Return an error to reject the response; it is wrapped with `ErrResponseValidator`.
+
+```go
+cooper.Upgrade(conn, req,
+    cooper.ResponseValidator(func(req *http.Request, resp *http.Response) error {
+        if resp.Header.Get("Sec-WebSocket-Accept") != deriveAccept(req.Header.Get("Sec-WebSocket-Key")) {
+            return errors.New("accept header mismatch")
+        }
+        return nil
+    }),
+)
+```
+
+## Error sentinels
+All errors wrap a sentinel value detectable with `errors.Is`.
+- `ErrHijackFailed`: Connection could not be hijacked from the HTTP server.
+- `ErrWriteHandshake`: Failed to write the `101` response.
+- `ErrFlushHandshake`: Failed to flush the `101` response.
+- `ErrHandlerPanic`: Recovered panic in the handler goroutine.
+- `ErrDrainBuffer`: Could not drain the HTTP read buffer before handing off the connection.
+- `ErrMissingUpgradeHeader`: Request carries no `Upgrade` header.
+- `ErrSetDeadline`: Handshake deadline could not be set.
+- `ErrSendRequest`: Upgrade request could not be written.
+- `ErrReadResponse`: Server response could not be read or parsed.
+- `ErrUnexpectedStatus`: Server responded with a status other than `101`.
+- `ErrProtocolMismatch`: Server's `Upgrade` response header doesn't match what was requested.
+- `ErrMissingConnectionHeader`: Server's response is missing `Connection: Upgrade`.
+- `ErrResponseValidator`: A `ResponseValidator` rejected the response.
