@@ -1,3 +1,3 @@
-module github.com/cornejong/cooper
+module lowbit.dev/cooper
 
 go 1.25.6

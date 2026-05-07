@@ -1,6 +1,7 @@
 package cooper
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -77,7 +78,7 @@ func TestUpgrade_MissingUpgradeHeader(t *testing.T) {
 		t.Fatal("expected error for missing Upgrade header")
 	}
 
-	if !strings.Contains(err.Error(), "missing Upgrade header") {
+	if !errors.Is(err, ErrMissingUpgradeHeader) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -173,7 +174,7 @@ func TestUpgrade_Non101StatusReturnsError(t *testing.T) {
 		t.Fatal("expected error for non-101 response")
 	}
 
-	if !strings.Contains(err.Error(), "unexpected status") {
+	if !errors.Is(err, ErrUnexpectedStatus) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -216,7 +217,7 @@ func TestUpgrade_MismatchedUpgradeHeaderReturnsError(t *testing.T) {
 		t.Fatal("expected error for mismatched Upgrade header")
 	}
 
-	if !strings.Contains(err.Error(), "different upgrade value") {
+	if !errors.Is(err, ErrProtocolMismatch) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -258,7 +259,7 @@ func TestUpgrade_MissingConnectionUpgradeInResponse(t *testing.T) {
 		t.Fatal("expected error for missing Connection: Upgrade in response")
 	}
 
-	if !strings.Contains(err.Error(), "missing Connection: Upgrade") {
+	if !errors.Is(err, ErrMissingConnectionHeader) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -266,3 +267,81 @@ func TestUpgrade_MissingConnectionUpgradeInResponse(t *testing.T) {
 // fakeConn is a minimal net.Conn used where we only need to test pre-send
 // validation and never actually write to a network.
 type fakeConn struct{ net.Conn }
+
+func TestUpgrade_ResponseValidatorCalledWithResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer raw.Close()
+		buf := make([]byte, 4096)
+		raw.Read(buf)
+		raw.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test/1\r\nX-Token: secret\r\n\r\n"))
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	var gotToken string
+	req, _ := http.NewRequest("GET", "http://"+ln.Addr().String()+"/", nil)
+	req.Header.Set("Upgrade", "test/1")
+
+	upgraded, err := Upgrade(conn, req, ResponseValidator(func(req *http.Request, resp *http.Response) error {
+		gotToken = resp.Header.Get("X-Token")
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	upgraded.Close()
+
+	if gotToken != "secret" {
+		t.Fatalf("expected X-Token %q, got %q", "secret", gotToken)
+	}
+}
+
+func TestUpgrade_ResponseValidatorRejection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer raw.Close()
+		buf := make([]byte, 4096)
+		raw.Read(buf)
+		raw.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test/1\r\n\r\n"))
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	req, _ := http.NewRequest("GET", "http://"+ln.Addr().String()+"/", nil)
+	req.Header.Set("Upgrade", "test/1")
+
+	_, err = Upgrade(conn, req, ResponseValidator(func(req *http.Request, resp *http.Response) error {
+		return fmt.Errorf("bad accept header")
+	}))
+	if err == nil {
+		t.Fatal("expected error from validator")
+	}
+	if !errors.Is(err, ErrResponseValidator) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

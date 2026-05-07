@@ -145,7 +145,7 @@ func TestHijack_MissingConnectionUpgradeHeader(t *testing.T) {
 func TestHijack_UnsupportedProto(t *testing.T) {
 	srv := httptest.NewServer(Hijack(func(conn net.Conn, proto string) {
 		conn.Close()
-	}, "allowed/1"))
+	}, Protocols("allowed/1")))
 	defer srv.Close()
 
 	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
@@ -186,7 +186,7 @@ func TestHijack_ProtoCaseInsensitive(t *testing.T) {
 		defer conn.Close()
 		got = proto
 		wg.Done()
-	}, "MyProto/1"))
+	}, Protocols("MyProto/1")))
 	defer srv.Close()
 
 	addr := strings.TrimPrefix(srv.URL, "http://")
@@ -259,7 +259,7 @@ func TestHijack_MultipleProtos(t *testing.T) {
 		defer conn.Close()
 		got = proto
 		wg.Done()
-	}, "alpha/1", "beta/2", "gamma/3"))
+	}, Protocols("alpha/1", "beta/2", "gamma/3")))
 	defer srv.Close()
 
 	addr := strings.TrimPrefix(srv.URL, "http://")
@@ -270,5 +270,46 @@ func TestHijack_MultipleProtos(t *testing.T) {
 
 	if got != "beta/2" {
 		t.Fatalf("expected %q, got %q", "beta/2", got)
+	}
+}
+
+func TestHijack_ResponseHeaders(t *testing.T) {
+	srv := httptest.NewServer(Hijack(
+		func(conn net.Conn, proto string) { conn.Close() },
+		ResponseHeaders(func(r *http.Request, proto string) http.Header {
+			h := http.Header{}
+			h.Set("X-Challenge-Response", r.Header.Get("X-Challenge"))
+			return h
+		}),
+	))
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	req := "GET / HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: test/1\r\n" +
+		"X-Challenge: opensesame\r\n" +
+		"\r\n"
+	conn.Write([]byte(req))
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected 101, got %d", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("X-Challenge-Response"); got != "opensesame" {
+		t.Fatalf("expected X-Challenge-Response %q, got %q", "opensesame", got)
 	}
 }
