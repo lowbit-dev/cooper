@@ -1,6 +1,7 @@
 package cooper
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -75,9 +76,9 @@ func WithProtocol(proto string) DialOption {
 	}
 }
 
-// Dial establishes a connection to the host specified in r, performs
-// an HTTP/1.1 protocol upgrade, and returns the established connection.
-func Dial(r *http.Request, opts ...DialOption) (net.Conn, error) {
+// DialContext establishes a connection to the host specified in r, performs
+// an HTTP/1.1 protocol upgrade, and returns the established connection using the provided context.
+func DialContext(ctx context.Context, r *http.Request, opts ...DialOption) (net.Conn, error) {
 	if r == nil {
 		return nil, ErrNilRequest
 	}
@@ -120,7 +121,7 @@ func Dial(r *http.Request, opts ...DialOption) (net.Conn, error) {
 		}
 	}
 
-	conn, err := dialer.DialContext(r.Context(), "tcp", addr)
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrDialFailed, err)
 	}
@@ -134,7 +135,7 @@ func Dial(r *http.Request, opts ...DialOption) (net.Conn, error) {
 
 		tlsConn := tls.Client(conn, tlsConfig)
 
-		if err := tlsConn.HandshakeContext(r.Context()); err != nil {
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("%w: %w", ErrTLSHandshakeFailed, err)
 		}
@@ -148,4 +149,12 @@ func Dial(r *http.Request, opts ...DialOption) (net.Conn, error) {
 	}
 
 	return upgradedConn, nil
+}
+
+// Dial establishes a connection to the host specified in r, performs
+// an HTTP/1.1 protocol upgrade, and returns the established connection using the request context.
+//
+// In case you want to use an alternate context for dialing use DialContext instead.
+func Dial(r *http.Request, opts ...DialOption) (net.Conn, error) {
+	return DialContext(r.Context(), r, opts...)
 }
